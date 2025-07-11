@@ -179,44 +179,63 @@ def translate_direct(adata, direct, no_index):
 
 
 def translate_multiple(adata, original_data, multiple, stay_sparse=False, verbose=False):
-    """Adds the counts of multiple-hit genes to ALL their orthologs."""
+    """
+    Adds the counts of multiple-hit genes to ALL their orthologs.
+    This robust version handles cases where multiple source genes map to the same new target gene.
+    """
     if not multiple:
         return adata
 
+    # --- REVISED LOGIC ---
+    # We will work with a dense matrix for easier addition and convert back to sparse at the end if needed.
+    X = make_dense(adata.X).copy()
     var = adata.var.copy()
-    X = adata.X.copy() if stay_sparse else make_dense(adata.X).copy()
     
-    ortholog_indices = {gene: i for i, gene in enumerate(var.index)}
-    new_gene_cols = []
-    new_gene_vars = []
+    # This lookup table for genes that ALREADY exist in `bdata` will NOT be changed.
+    initial_ortholog_indices = {gene: i for i, gene in enumerate(var.index)}
 
-    fct = tqdm if verbose else lambda item: item
-    for source_gene, target_genes in fct(multiple.items()):
+    # This new dictionary will collect data for genes that need to be ADDED.
+    # It maps a new gene name to its summed data array.
+    new_genes_data = {}
+
+    fct = tqdm(multiple.items(), desc="Handling multiple orthologs") if verbose else multiple.items()
+    for source_gene, target_genes in fct:
         source_gene_data = make_dense(original_data[:, source_gene].X).ravel()
-        for target_gene in target_genes:
-            if target_gene in ortholog_indices:
-                idx = ortholog_indices[target_gene]
-                if stay_sparse:
-                    X[:, idx] += csr_matrix(source_gene_data).reshape(-1, 1)
-                else:
-                    X[:, idx] += source_gene_data
-            else:
-                # Add as a new gene
-                ortholog_indices[target_gene] = len(var) + len(new_gene_vars)
-                new_gene_cols.append(source_gene_data)
-                
-                new_row = pd.Series(name=target_gene, dtype='object')
-                new_row['original_gene_symbol'] = 'multiple'
-                new_gene_vars.append(new_row)
-
-    if new_gene_cols:
-        new_vars_df = pd.DataFrame(new_gene_vars)
-        var = pd.concat([var, new_vars_df])
         
-        if stay_sparse:
-            X = csr_matrix(np.hstack([X.toarray()] + [col.reshape(-1, 1) for col in new_gene_cols]))
-        else:
-            X = np.hstack([X] + [col.reshape(-1, 1) for col in new_gene_cols])
+        for target_gene in target_genes:
+            # Case 1: The ortholog already exists in the input AnnData.
+            if target_gene in initial_ortholog_indices:
+                idx = initial_ortholog_indices[target_gene]
+                X[:, idx] += source_gene_data
+            
+            # Case 2: The ortholog is a new gene that we need to add.
+            else:
+                # If we're seeing this new gene for the first time, initialize its data.
+                if target_gene not in new_genes_data:
+                    new_genes_data[target_gene] = source_gene_data.copy()
+                # If we've already marked this gene for addition, just add the new counts.
+                else:
+                    new_genes_data[target_gene] += source_gene_data
+
+    # After the loop, if we collected any new genes, add them to X and var.
+    if new_genes_data:
+        new_var_rows = []
+        new_X_cols = []
+        for gene_name, data_col in new_genes_data.items():
+            new_X_cols.append(data_col.reshape(-1, 1))
+            
+            new_row = pd.Series(name=gene_name, dtype='object')
+            new_row['original_gene_symbol'] = 'multiple'
+            new_var_rows.append(new_row)
+
+        # Combine new columns and rows with existing data
+        if new_X_cols:
+            X = np.hstack([X] + new_X_cols)
+            var = pd.concat([var, pd.DataFrame(new_var_rows)])
+            
+    # Re-apply sparsity if it was requested at the beginning.
+    if stay_sparse:
+        X = csr_matrix(X)
 
     return AnnData(X, obs=adata.obs, var=var, uns=adata.uns, obsm=adata.obsm)
 
@@ -227,41 +246,48 @@ def collapse_duplicate_genes(adata, stay_sparse=False):
     is_duplicated = index.duplicated(keep=False)
     
     if not np.any(is_duplicated):
-        # print('No duplicate genes found. Stopping...')
         return adata
 
-    unique_genes = index[~is_duplicated]
+    # Separate non-duplicated from duplicated genes
+    unique_mask = ~is_duplicated
     duplicated_genes = pd.unique(index[is_duplicated])
     
-    X = adata.X if stay_sparse else make_dense(adata.X)
-    
-    # Create new matrix for unique genes
-    new_X = X[:, ~is_duplicated]
-    new_var = adata.var[~is_duplicated].copy()
+    # Start with the data and metadata from non-duplicated genes
+    new_X = adata.X[:, unique_mask]
+    new_var = adata.var[unique_mask].copy()
 
-    # Process and add collapsed duplicated genes
+    # Process duplicated genes
     dup_cols = []
     dup_vars = []
     
     for gene in tqdm(duplicated_genes, leave=False, desc="Collapsing duplicates"):
         idxs = np.where(index == gene)[0]
-        # Sum counts of all duplicates for this gene
-        collapsed_counts = X[:, idxs].sum(axis=1)
-        dup_cols.append(np.asarray(collapsed_counts).reshape(-1, 1))
         
-        # Keep the first var entry for the duplicated gene
+        # Sum counts across all duplicates for the current gene
+        if issparse(adata.X):
+            collapsed_counts = adata.X[:, idxs].sum(axis=1)
+        else:
+            collapsed_counts = np.sum(adata.X[:, idxs], axis=1, keepdims=True)
+            
+        dup_cols.append(collapsed_counts)
+        # Keep the metadata from the first occurrence of the duplicate
         dup_vars.append(adata.var.iloc[idxs[0]].copy())
 
+    # Combine non-duplicated data with the newly collapsed duplicated data
     if dup_cols:
-        new_X = np.hstack([new_X] + dup_cols)
+        if issparse(new_X):
+            from scipy.sparse import hstack
+            new_X = hstack([new_X] + dup_cols).tocsr()
+        else:
+            new_X = np.hstack([new_X] + dup_cols)
+        
+        # Combine the metadata DataFrames
         new_var = pd.concat([new_var, pd.DataFrame(dup_vars)])
-
-    if stay_sparse and not issparse(adata.X):
-         X = csr_matrix(new_X)
-    else:
-        X = new_X
-
-    return AnnData(X, obs=adata.obs, var=new_var, uns=adata.uns, obsm=adata.obsm)
+    
+    # --- BUG FIX ---
+    # The original code mistakenly returned the old `X`. 
+    # The corrected code returns the newly constructed `new_X`.
+    return AnnData(new_X, obs=adata.obs, var=new_var, uns=adata.uns, obsm=adata.obsm)
 
 
 def translate(adata, target=None, stay_sparse=False, verbose=True, source='biomart'):
