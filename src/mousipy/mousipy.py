@@ -265,11 +265,15 @@ def collapse_duplicate_genes(adata, stay_sparse=False):
 
 
 def translate(adata, target=None, stay_sparse=False, verbose=True, source='biomart'):
-    """Translates adata.var between species using orthologs from the specified source."""
+    """
+    Translates adata.var between species using orthologs from the specified source.
+    This corrected version handles duplicates at each stage to prevent index errors.
+    """
     source_lower = source.lower()
     if source_lower not in ['hcop', 'biomart']:
         raise ValueError('source must be either "HCOP" or "biomart"')
 
+    # 1. Check for all orthologs
     direct, multiple, no_hit, no_index = check_orthologs(
         adata.var_names, tab=None, target=target, verbose=verbose, source=source_lower
     )
@@ -279,8 +283,16 @@ def translate(adata, target=None, stay_sparse=False, verbose=True, source='bioma
         print(f'Found no orthologs for {len(no_hit)} genes.')
         print(f'Found no index in the table for {len(no_index)} genes.')
 
+    # 2. Translate direct hits and simple guesses
     bdata = translate_direct(adata, direct, no_index)
+
+    # 3. Collapse duplicates created by translate_direct BEFORE proceeding
+    bdata = collapse_duplicate_genes(bdata, stay_sparse=stay_sparse)
+
+    # 4. Add data from genes with multiple orthologs
     bdata = translate_multiple(bdata, adata, multiple, stay_sparse=stay_sparse, verbose=verbose)
+
+    # 5. Collapse any new duplicates that may have been introduced by translate_multiple
     bdata = collapse_duplicate_genes(bdata, stay_sparse=stay_sparse)
     
     return bdata
